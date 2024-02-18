@@ -28,11 +28,11 @@ impl Framebuffer {
         }
 
         self.pixels[(y * (self.width * self.channels) + x * self.channels + 0) as usize] =
-            (value.x * 255.0) as u8;
+            (value.z * 255.0) as u8;
         self.pixels[(y * (self.width * self.channels) + x * self.channels + 1) as usize] =
             (value.y * 255.0) as u8;
         self.pixels[(y * (self.width * self.channels) + x * self.channels + 2) as usize] =
-            (value.z * 255.0) as u8;
+            (value.x * 255.0) as u8;
         self.pixels[(y * (self.width * self.channels) + x * self.channels + 3) as usize] =
             (value.w * 255.0) as u8;
     }

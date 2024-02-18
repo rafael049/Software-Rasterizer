@@ -1,8 +1,15 @@
 use std::fs::File;
 use std::io::BufReader;
 
+use std::io::Cursor;
+use image::io::Reader as ImageReader;
+
 use framebuffer::Framebuffer;
+use obj::TexturedVertex;
 use obj::{self, load_obj, Obj, Vertex};
+use sdl2::{pixels::Color, render::TextureCreator, video, event::Event, keyboard::Keycode};
+
+use crate::pipeline::Uniforms;
 
 extern crate nalgebra_glm as glm;
 extern crate sdl2;
@@ -23,37 +30,8 @@ fn array3_to_vec3(from: &[f32; 3]) -> glm::Vec3 {
     return glm::vec3(from[0], from[1], from[2]);
 }
 
-fn to_baricentric_coords(
-    point: glm::I32Vec2,
-    p1: glm::I32Vec2,
-    p2: glm::I32Vec2,
-    p3: glm::I32Vec2,
-) -> (f32, f32, f32) {
-    let a = glm::vec3((p3 - p1).x, (p3 - p2).x, (point - p3).x);
-    let b = glm::vec3((p3 - p1).y, (p3 - p2).y, (point - p3).y);
-    let cross = glm::cross::<_>(&a, &b);
-
-    if cross.z == 0 {
-        return (-1.0, -1.0, 1.0);
-    }
-
-    let (u, v) = (
-        cross.x as f32 / cross.z as f32,
-        cross.y as f32 / cross.z as f32,
-    );
-
-    return (u, v, 1.0 - u - v);
-}
-
-fn is_inside_triangle(
-    point: glm::I32Vec2,
-    p1: glm::I32Vec2,
-    p2: glm::I32Vec2,
-    p3: glm::I32Vec2,
-) -> bool {
-    let (u, v, w) = to_baricentric_coords(point, p1, p2, p3);
-
-    return u >= 0.0 && v >= 0.0 && w >= 0.0;
+fn array2_to_vec2(from: &[f32; 2]) -> glm::Vec2 {
+    return glm::vec2(from[0], from[1]);
 }
 
 fn triangle(
@@ -72,42 +50,36 @@ fn triangle(
     image.line(p3, p1, color);
 }
 
-pub fn fill_triangle(
-    image: &mut Framebuffer,
-    norm_p1: vertex::Vertex,
-    norm_p2: vertex::Vertex,
-    norm_p3: vertex::Vertex,
-    color: glm::Vec4,
-) {
-    let p1 = norm_to_image_coords(&image, &norm_p1.position);
-    let p2 = norm_to_image_coords(&image, &norm_p2.position);
-    let p3 = norm_to_image_coords(&image, &norm_p3.position);
-    let min_x = p1.x.min(p2.x).min(p3.x).max(0);
-    let max_x = p1.x.max(p2.x).max(p3.x).min(image.width);
-    let min_y = p1.y.min(p2.y).min(p3.y).max(0);
-    let max_y = p1.y.max(p2.y).max(p3.y).min(image.height);
-
-    for x in min_x..max_x {
-        for y in min_y..max_y {
-            if is_inside_triangle(glm::vec2(x, y), p1, p2, p3) {
-                let (u, v, w) = to_baricentric_coords(glm::vec2(x, y), p1, p2, p3);
-                let depth = -(u * (norm_p1.position.z)
-                    + v * (norm_p2.position.z)
-                    + w * (norm_p3.position.z))
-                    / 2.0
-                    + 0.5;
-                if depth < image.get_depth(x, y) {
-                    image.set(x, y, color);
-                    image.set_depth(x, y, depth)
-                }
-            }
-        }
-    }
-}
 fn main() {
     println!("Renderer started!");
 
-    let (width, height) = (1280, 720);
+    let (width, height) = (1920i32, 1080i32);
+
+    let sdl2_context = sdl2::init().unwrap();
+    let video_subsystem = sdl2_context.video().unwrap();
+    let window = video_subsystem
+        .window("Rasterizer", width as u32, height as u32)
+        .position_centered()
+        .build()
+        .map_err(|e| e.to_string())
+        .unwrap();
+
+    let mut canvas = window
+        .into_canvas()
+        .target_texture()
+        .present_vsync()
+        .build()
+        .map_err(|e| e.to_string())
+        .unwrap();
+
+    canvas.set_draw_color(Color::RGB(0, 0, 0));
+    canvas.clear();
+    canvas.present();
+
+    let texture_creator: TextureCreator<_> = canvas.texture_creator();
+
+    let mut texture =
+        texture_creator.create_texture(None, sdl2::render::TextureAccess::Streaming, width as u32, height as u32).unwrap();
 
     println!("Resolution: {}x{}", width, height);
 
@@ -115,7 +87,7 @@ fn main() {
 
     println!("Reading file {filename}.");
     let input = BufReader::new(File::open(filename).unwrap());
-    let mesh: Obj<Vertex, i32> = obj::load_obj(input).unwrap();
+    let mesh: Obj<TexturedVertex, i32> = obj::load_obj(input).unwrap();
 
     println!("File {filename} succesfuly read.");
 
@@ -124,6 +96,7 @@ fn main() {
 
     let mut positions = vec![];
     let mut normals = vec![];
+    let mut tex_coords = vec![];
 
     println!("Getting vertex data from obj.");
     for i in (0..indices.len()).step_by(3) {
@@ -134,15 +107,57 @@ fn main() {
         normals.push(array3_to_vec3(&vertices[indices[i] as usize].normal));
         normals.push(array3_to_vec3(&vertices[indices[i + 1] as usize].normal));
         normals.push(array3_to_vec3(&vertices[indices[i + 2] as usize].normal));
+
+        tex_coords.push(array3_to_vec3(&vertices[indices[i] as usize].texture).xy());
+        tex_coords.push(array3_to_vec3(&vertices[indices[i+1] as usize].texture).xy());
+        tex_coords.push(array3_to_vec3(&vertices[indices[i+2] as usize].texture).xy());
     }
+
+    println!("Loading Textures");
+
+    let img = ImageReader::open("Suzanne.png").unwrap();
+
+    let texture1 = std::rc::Rc::new(img.decode().unwrap());
+
+    let textures = vec![texture1];
 
     let mut rasterizer = pipeline::Pipeline::new(width, height);
 
-    println!("Render pass started.");
-    rasterizer.run(&positions, &normals);
-    println!("Render pass ended.");
+    let mut event_pump = sdl2_context.event_pump().unwrap();
 
-    println!("Writing output file.");
-    rasterizer.rasterizer.framebuffer.write_to_file("test.png");
-    println!("Output put file written.");
+    'running: loop {
+        // get the inputs here
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => break 'running,
+                _ => {}
+            }
+        }
+
+        let uniforms = Uniforms {
+            time: sdl2_context.timer().unwrap().ticks() as f32,
+            sun_light_dir: glm::vec3(1.0, -1.0, -1.0).normalize(),
+            model_mat: glm::identity(),
+            gamma: 2.2,
+        };
+
+        rasterizer.run(&positions, &normals, &tex_coords, &textures, uniforms);
+
+        texture.update(None, &rasterizer.rasterizer.framebuffer.pixels, (width*4i32) as usize).unwrap();
+
+        canvas.set_draw_color(Color::RGB(25, 25, 128));
+        canvas.clear();
+
+        canvas.copy(&texture, None, None).unwrap();
+        
+        canvas.present();
+    }
+
+    //println!("Writing output file.");
+    //rasterizer.rasterizer.framebuffer.write_to_file("test.png");
+    //println!("Output put file written.");
 }
